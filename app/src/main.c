@@ -23,6 +23,8 @@ static void start_scan(void);
 
 static struct bt_conn *default_conn;
 
+static bool ad_has_name(struct bt_data *data, void *user_data);
+
 static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 			 struct net_buf_simple *ad)
 {
@@ -35,6 +37,12 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 	/* We're only interested in connectable events */
 	if (type != BT_GAP_ADV_TYPE_ADV_IND &&
 	    type != BT_GAP_ADV_TYPE_ADV_DIRECT_IND) {
+		return;
+	}
+
+	bool matched = false;
+	bt_data_parse(ad, ad_has_name, &matched);
+	if (!matched) {
 		return;
 	}
 
@@ -110,6 +118,21 @@ BT_CONN_CB_DEFINE(conn_callbacks) = {
 	.connected = connected,
 	.disconnected = disconnected,
 };
+
+static bool ad_has_name(struct bt_data *data, void *user_data)
+{
+	bool *found = user_data;
+
+	if (data->type == BT_DATA_NAME_COMPLETE ||
+	    data->type == BT_DATA_NAME_SHORTENED) {
+		if (data->data_len == strlen("Hake") &&
+		    memcmp(data->data, "Hake", data->data_len) == 0) {
+			*found = true;
+			return false;   /* stop parsing */
+		}
+	}
+	return true;   /* keep parsing */
+}
 
 int main(void)
 {
