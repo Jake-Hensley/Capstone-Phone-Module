@@ -1,0 +1,8 @@
+/* One native CDC ACM function on the USB device controller.
+ * Keep zephyr,console / zephyr,log on the board's hardware UART or RTT,
+ * never on this port, so the JSON stream stays clean. */
+&zephyr_udc0 {
+	cdc_acm_uart0: cdc_acm_uart0 {
+		compatible = "zephyr,cdc-acm-uart";
+	};
+};

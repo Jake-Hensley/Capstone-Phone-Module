@@ -6,6 +6,11 @@ project(central)
 
 target_sources(app PRIVATE
   src/main.c
+  src/usb_dev.c
+)
+
+target_sources(app PRIVATE
+  inc
 )
 
 zephyr_library_include_directories(${ZEPHYR_BASE}/samples/bluetooth)
