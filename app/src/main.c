@@ -1,13 +1,17 @@
 /*
- * PPG bridge: BLE central -> USB CDC ACM.
+ * PPG bridge: BLE observer -> USB CDC ACM.
  *
- * - Scans for a peripheral named "Hake", subscribes to its PPG characteristic.
- * - Each notification is decoded into (red, ir, sensor time) samples.
+ * - Scans continuously (never connects) for advertisements from a sensor
+ *   named "BEACON" that carry PPG samples in manufacturer-specific data.
+ * - Each advertisement is decoded into (red, ir, sensor time) samples.
+ *   The same advertisement is heard many times; repeats are dropped by
+ *   their sensor timestamp.
  * - Samples are written to the USB CDC ACM port as one JSON object per line:
  *       {"red":54123,"ir":78234,"t_ms":123456}\n
  *   but only while the host has DTR asserted.
- * - Lines received from the host are parsed; {"cmd":"sync"} triggers a fresh
- *   GATT read of the PPG characteristic and flushes any buffered samples.
+ * - Lines received from the host are parsed; {"cmd":"sync"} is accepted for
+ *   compatibility but only logged (there is no connection to read from).
+ *   Buffered samples are flushed as soon as DTR is asserted.
  *
  * Connect from a PC with: tio /dev/ttyACM0
  */
@@ -26,10 +30,7 @@
 #include <zephyr/logging/log.h>
 
 #include <zephyr/bluetooth/bluetooth.h>
-#include <zephyr/bluetooth/hci.h>
-#include <zephyr/bluetooth/conn.h>
-#include <zephyr/bluetooth/uuid.h>
-#include <zephyr/bluetooth/gatt.h>
+#include <zephyr/bluetooth/gap.h>
 
 #include "usb_dev.h"
 
@@ -39,16 +40,29 @@ LOG_MODULE_REGISTER(ppg_bridge, LOG_LEVEL_INF);
  * Configuration
  * ====================================================================== */
 
-#define BLE_PERIPHERAL_NAME   "Hake" // TODO: change this its test
-#define BLE_MIN_RSSI          (-20)   /* connect only to close devices */
+#define BLE_PERIPHERAL_NAME   "BEACON" // TODO: change this its test
+#define BLE_MIN_RSSI          (-70)   /* ignore weaker advertisements */
 
-/* Replace with the peripheral's real (ideally 128-bit custom) UUIDs. */
-static struct bt_uuid_16 hake_svc_uuid = BT_UUID_INIT_16(0x180D);
-static struct bt_uuid_16 hake_chr_uuid = BT_UUID_INIT_16(0x2A38);
+/*
+ * ADVERTISEMENT FORMAT (legacy advertising, 31 bytes max):
+ *
+ *   Flags                         3 B
+ *   Complete name "BEACON"        2 + 6 B
+ *   Manufacturer specific data    2 B header (len, 0xFF), then:
+ *     company ID  uint16 LE       PPG_COMPANY_ID
+ *     version     uint8           PPG_ADV_VERSION
+ *     records     N x 12 B        (one record fits in legacy advertising)
+ *
+ * The name must be in the advertisement itself, not the scan response,
+ * because scanning is passive.
+ */
+#define PPG_COMPANY_ID        0xFFFFU /* SIG-reserved for internal/test use */
+#define PPG_ADV_VERSION       0x01U
+#define PPG_MFR_HDR_SIZE      3       /* company ID + version */
 
 /*
  * ASSUMED BLE PAYLOAD FORMAT -- adapt decode_ble_payload() if yours differs.
- * A notification (or read response) carries N back-to-back records:
+ * The manufacturer data (after its header) carries N back-to-back records:
  *
  *   offset 0  uint32 LE  sensor timestamp, ms (peripheral clock)
  *   offset 4  uint32 LE  red ADC value (18-bit, 0..262143)
@@ -77,6 +91,8 @@ struct ppg_sample {
 K_MSGQ_DEFINE(sample_q, sizeof(struct ppg_sample), PPG_SAMPLE_QUEUE_LEN, 8);
 
 static atomic_t dropped_samples;
+static atomic_t matched_advs;   /* health counters, cleared every 10 s */
+static atomic_t new_samples;
 
 static void enqueue_sample(const struct ppg_sample *s)
 {
@@ -93,13 +109,14 @@ static void enqueue_sample(const struct ppg_sample *s)
  * Timestamp mapping.
  *
  * t_ms must be nonnegative and monotonic for the whole firmware session,
- * even across BLE reconnects or a peripheral reboot. The sensor's own clock
- * is kept (it carries the precise sample spacing the pulse estimator wants),
- * but shifted by an offset anchored to this device's uptime. A new offset is
- * chosen on each connection, and whenever the sensor clock resets, so output
- * never goes backwards.
+ * even across a peripheral reboot. The sensor's own clock is kept (it carries
+ * the precise sample spacing the pulse estimator wants), but shifted by an
+ * offset anchored to this device's uptime. The offset is chosen on the first
+ * sample and again whenever the sensor clock resets, so output never goes
+ * backwards. Repeated copies of the same advertisement carry the same sensor
+ * timestamp and are dropped here as duplicates.
  *
- * Touched only from the BT RX thread (connected/notify/read callbacks).
+ * Touched only from the BT RX thread (scan callback).
  * ---------------------------------------------------------------------- */
 static bool     ts_anchored;
 static int64_t  ts_offset;
@@ -160,6 +177,7 @@ static void decode_ble_payload(const uint8_t *data, uint16_t len)
 		s.red = red;
 		s.ir = ir;
 		enqueue_sample(&s);
+		atomic_inc(&new_samples);
 	}
 }
 
@@ -186,7 +204,9 @@ static void cdc_isr(const struct device *dev, void *user_data)
 {
 	ARG_UNUSED(user_data);
 
-	while (uart_irq_update(dev) && uart_irq_is_pending(dev)) {
+	/* uart_irq_update() returns void in this Zephyr version. */
+	for (uart_irq_update(dev); uart_irq_is_pending(dev);
+	     uart_irq_update(dev)) {
 		if (uart_irq_rx_ready(dev)) {
 			uint8_t buf[64];
 			int n = uart_fifo_read(dev, buf, sizeof(buf));
@@ -317,259 +337,96 @@ K_THREAD_DEFINE(usb_writer, 1024, usb_writer_thread, NULL, NULL, NULL,
 		7, 0, 0);
 
 /* ======================================================================
- * BLE central
+ * BLE observer
  * ====================================================================== */
 
-static struct k_spinlock conn_lock;
-static struct bt_conn *default_conn;
-static atomic_t chr_ready;          /* subscribed & value handle valid */
-static uint16_t chr_value_handle;
+struct adv_info {
+	bool name_ok;
+	const uint8_t *mfr;   /* only valid while device_found() is running */
+	uint8_t mfr_len;
+};
 
-static struct bt_gatt_discover_params discover_params;
-static struct bt_gatt_subscribe_params subscribe_params;
-static struct bt_gatt_exchange_params mtu_params;
-static struct bt_gatt_read_params read_params;
-static atomic_t read_busy;
-
-static void start_scan(void);
-
-static void clear_default_conn(void)
+/* Collects the name match and our manufacturer data in one pass. */
+static bool parse_ad(struct bt_data *data, void *user_data)
 {
-	k_spinlock_key_t key = k_spin_lock(&conn_lock);
-	struct bt_conn *c = default_conn;
+	struct adv_info *info = user_data;
 
-	default_conn = NULL;
-	k_spin_unlock(&conn_lock, key);
-
-	if (c) {
-		bt_conn_unref(c);
-	}
-}
-
-static uint8_t notify_func(struct bt_conn *conn,
-			   struct bt_gatt_subscribe_params *params,
-			   const void *data, uint16_t length)
-{
-	ARG_UNUSED(conn);
-
-	if (!data) {
-		LOG_INF("Unsubscribed");
-		params->value_handle = 0U;
-		atomic_clear(&chr_ready);
-		return BT_GATT_ITER_STOP;
-	}
-
-	decode_ble_payload(data, length);
-	return BT_GATT_ITER_CONTINUE;
-}
-
-static uint8_t discover_func(struct bt_conn *conn,
-			     const struct bt_gatt_attr *attr,
-			     struct bt_gatt_discover_params *params)
-{
-	int err;
-
-	if (!attr) {
-		LOG_WRN("Discovery finished without finding everything");
-		memset(params, 0, sizeof(*params));
-		return BT_GATT_ITER_STOP;
-	}
-
-	if (params->type == BT_GATT_DISCOVER_PRIMARY) {
-		struct bt_gatt_service_val *svc = attr->user_data;
-
-		discover_params.uuid = &hake_chr_uuid.uuid;
-		discover_params.start_handle = attr->handle + 1;
-		discover_params.end_handle = svc->end_handle;
-		discover_params.type = BT_GATT_DISCOVER_CHARACTERISTIC;
-
-		err = bt_gatt_discover(conn, &discover_params);
-		if (err) {
-			LOG_ERR("Char discovery failed (err %d)", err);
-		}
-	} else if (params->type == BT_GATT_DISCOVER_CHARACTERISTIC) {
-		struct bt_gatt_chrc *chrc = attr->user_data;
-
-		subscribe_params.value_handle = chrc->value_handle;
-		chr_value_handle = chrc->value_handle;
-
-		discover_params.uuid = BT_UUID_GATT_CCC;
-		discover_params.start_handle = chrc->value_handle + 1;
-		discover_params.type = BT_GATT_DISCOVER_DESCRIPTOR;
-
-		err = bt_gatt_discover(conn, &discover_params);
-		if (err) {
-			LOG_ERR("CCC discovery failed (err %d)", err);
-		}
-	} else {
-		subscribe_params.notify = notify_func;
-		subscribe_params.value = BT_GATT_CCC_NOTIFY;
-		subscribe_params.ccc_handle = attr->handle;
-
-		err = bt_gatt_subscribe(conn, &subscribe_params);
-		if (err && err != -EALREADY) {
-			LOG_ERR("Subscribe failed (err %d)", err);
-		} else {
-			atomic_set(&chr_ready, 1);
-			LOG_INF("Subscribed, streaming PPG data");
-		}
-	}
-
-	return BT_GATT_ITER_STOP;
-}
-
-static uint8_t read_func(struct bt_conn *conn, uint8_t err,
-			 struct bt_gatt_read_params *params,
-			 const void *data, uint16_t length)
-{
-	ARG_UNUSED(conn);
-	ARG_UNUSED(params);
-
-	if (err) {
-		/* e.g. characteristic not readable: sync still flushes queue */
-		LOG_WRN("sync read failed (ATT err 0x%02x)", err);
-	} else if (data) {
-		decode_ble_payload(data, length);
-	}
-
-	atomic_clear(&read_busy);
-	return BT_GATT_ITER_STOP;
-}
-
-static bool ad_has_name(struct bt_data *data, void *user_data)
-{
-	bool *found = user_data;
-
-	if (data->type == BT_DATA_NAME_COMPLETE ||
-	    data->type == BT_DATA_NAME_SHORTENED) {
+	switch (data->type) {
+	case BT_DATA_NAME_COMPLETE:
+	case BT_DATA_NAME_SHORTENED:
 		if (data->data_len == strlen(BLE_PERIPHERAL_NAME) &&
 		    memcmp(data->data, BLE_PERIPHERAL_NAME, data->data_len) == 0) {
-			*found = true;
-			return false;
+			info->name_ok = true;
 		}
+		break;
+	case BT_DATA_MANUFACTURER_DATA:
+		if (data->data_len >= PPG_MFR_HDR_SIZE &&
+		    sys_get_le16(data->data) == PPG_COMPANY_ID &&
+		    data->data[2] == PPG_ADV_VERSION) {
+			info->mfr = data->data + PPG_MFR_HDR_SIZE;
+			info->mfr_len = data->data_len - PPG_MFR_HDR_SIZE;
+		}
+		break;
+	default:
+		break;
 	}
-	return true;
+
+	return true;   /* check every field */
 }
 
+/* Runs on the BT RX thread for every advertisement heard. */
 static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 			 struct net_buf_simple *ad)
 {
-	struct bt_conn *conn = NULL;
-	bool matched = false;
-	int err;
+	static bool seen;
+	struct adv_info info = { 0 };
 
-	if (default_conn) {
+	if (type != BT_GAP_ADV_TYPE_ADV_NONCONN_IND &&
+	    type != BT_GAP_ADV_TYPE_ADV_SCAN_IND &&
+	    type != BT_GAP_ADV_TYPE_ADV_IND) {
 		return;
 	}
 
-	if (type != BT_GAP_ADV_TYPE_ADV_IND &&
-	    type != BT_GAP_ADV_TYPE_ADV_DIRECT_IND) {
+	bt_data_parse(ad, parse_ad, &info);
+	if (!info.name_ok || !info.mfr) {
 		return;
 	}
-
-	bt_data_parse(ad, ad_has_name, &matched);
-	if (!matched) {
-		return;
-	}
-
-	char addr_str[BT_ADDR_LE_STR_LEN];
-
-	bt_addr_le_to_str(addr, addr_str, sizeof(addr_str));
-	LOG_INF("Device found: %s (RSSI %d)", addr_str, rssi);
 
 	if (rssi < BLE_MIN_RSSI) {
 		return;
 	}
 
-	if (bt_le_scan_stop()) {
-		return;
+	if (!seen) {
+		char addr_str[BT_ADDR_LE_STR_LEN];
+
+		bt_addr_le_to_str(addr, addr_str, sizeof(addr_str));
+		LOG_INF("Sensor found: %s (RSSI %d)", addr_str, rssi);
+		seen = true;
 	}
 
-	err = bt_conn_le_create(addr, BT_CONN_LE_CREATE_CONN,
-				BT_LE_CONN_PARAM_DEFAULT, &conn);
-	if (err) {
-		LOG_ERR("Create conn to %s failed (%d)", addr_str, err);
-		start_scan();
-		return;
-	}
+	atomic_inc(&matched_advs);
 
-	k_spinlock_key_t key = k_spin_lock(&conn_lock);
-
-	default_conn = conn;
-	k_spin_unlock(&conn_lock, key);
+	/* Decode now: the advertisement buffer is not kept after return. */
+	decode_ble_payload(info.mfr, info.mfr_len);
 }
 
-static void start_scan(void)
+static int start_scan(void)
 {
-	int err = bt_le_scan_start(BT_LE_SCAN_PASSIVE, device_found);
+	/* Duplicate filtering off: many controllers filter by address only,
+	 * which would hide every advertisement after the first. Window ==
+	 * interval keeps the radio listening continuously. */
+	int err = bt_le_scan_start(BT_LE_SCAN_PARAM(BT_LE_SCAN_TYPE_PASSIVE,
+						    BT_LE_SCAN_OPT_NONE,
+						    0x0060, 0x0060),
+				   device_found);
 
 	if (err) {
 		LOG_ERR("Scanning failed to start (err %d)", err);
-		return;
+		return err;
 	}
 	LOG_INF("Scanning started");
+	return 0;
 }
-
-static void mtu_cb(struct bt_conn *conn, uint8_t err,
-		   struct bt_gatt_exchange_params *params)
-{
-	ARG_UNUSED(params);
-	LOG_INF("MTU exchange %s, ATT MTU %u", err ? "failed" : "done",
-		bt_gatt_get_mtu(conn));
-}
-
-static void connected(struct bt_conn *conn, uint8_t err)
-{
-	if (err) {
-		LOG_ERR("Failed to connect: %u %s", err, bt_hci_err_to_str(err));
-		clear_default_conn();
-		start_scan();
-		return;
-	}
-
-	if (conn != default_conn) {
-		return;
-	}
-
-	LOG_INF("Connected: %s", bt_addr_le_str(bt_conn_get_dst(conn)));
-
-	ts_anchored = false;   /* re-anchor sensor clock for this link */
-
-	/* Bigger MTU lets the peripheral batch several samples per packet. */
-	mtu_params.func = mtu_cb;
-	(void)bt_gatt_exchange_mtu(conn, &mtu_params);
-
-	discover_params.uuid = &hake_svc_uuid.uuid;
-	discover_params.func = discover_func;
-	discover_params.start_handle = BT_ATT_FIRST_ATTRIBUTE_HANDLE;
-	discover_params.end_handle = BT_ATT_LAST_ATTRIBUTE_HANDLE;
-	discover_params.type = BT_GATT_DISCOVER_PRIMARY;
-
-	err = bt_gatt_discover(conn, &discover_params);
-	if (err) {
-		LOG_ERR("Discover failed (err %d)", err);
-	}
-}
-
-static void disconnected(struct bt_conn *conn, uint8_t reason)
-{
-	if (conn != default_conn) {
-		return;
-	}
-
-	LOG_INF("Disconnected, reason 0x%02x %s", reason,
-		bt_hci_err_to_str(reason));
-
-	atomic_clear(&chr_ready);
-	atomic_clear(&read_busy);
-	clear_default_conn();
-	start_scan();
-}
-
-BT_CONN_CB_DEFINE(conn_callbacks) = {
-	.connected = connected,
-	.disconnected = disconnected,
-};
 
 /* ======================================================================
  * Host -> device commands
@@ -585,38 +442,10 @@ static const struct json_obj_descr host_cmd_descr[] = {
 
 static void handle_sync(void)
 {
-	struct bt_conn *conn = NULL;
-	k_spinlock_key_t key = k_spin_lock(&conn_lock);
-
-	if (default_conn && atomic_get(&chr_ready)) {
-		conn = bt_conn_ref(default_conn);
-	}
-	k_spin_unlock(&conn_lock, key);
-
-	/* Buffered samples are flushed by the writer as soon as DTR is up;
-	 * additionally request a fresh value from the sensor. */
-	if (!conn) {
-		LOG_WRN("sync: no sensor connected");
-		return;
-	}
-
-	if (!atomic_cas(&read_busy, 0, 1)) {
-		bt_conn_unref(conn);
-		return;   /* a sync read is already in flight */
-	}
-
-	read_params.func = read_func;
-	read_params.handle_count = 1;
-	read_params.single.handle = chr_value_handle;
-	read_params.single.offset = 0U;
-
-	int err = bt_gatt_read(conn, &read_params);
-
-	if (err) {
-		LOG_WRN("sync: bt_gatt_read failed (%d)", err);
-		atomic_clear(&read_busy);
-	}
-	bt_conn_unref(conn);
+	/* No connection to read from in observer mode. Buffered samples are
+	 * already flushed by the writer as soon as DTR is up. Kept so host
+	 * software that sends sync keeps working. */
+	LOG_INF("sync requested (no-op in advertising mode)");
 }
 
 static void handle_line(char *line, size_t len)
@@ -641,7 +470,6 @@ static void handle_line(char *line, size_t len)
 	}
 
 	if (strcmp(cmd.cmd, "sync") == 0) {
-		LOG_INF("sync requested");
 		handle_sync();
 	} else {
 		LOG_DBG("unknown cmd '%s'", cmd.cmd);
@@ -732,13 +560,20 @@ int main(void)
 	}
 	LOG_INF("Bluetooth initialized");
 
-	start_scan();
+	err = start_scan();
+	if (err) {
+		return 0;
+	}
 
 	/* Periodic health log on the debug console (never on the CDC port). */
 	for (;;) {
 		k_sleep(K_SECONDS(10));
+		long a = atomic_clear(&matched_advs);
+		long n = atomic_clear(&new_samples);
 		long d = atomic_clear(&dropped_samples);
 
+		LOG_INF("last 10 s: %ld matching advertisements, %ld new samples",
+			a, n);
 		if (d) {
 			LOG_WRN("%ld samples dropped (queue full)", d);
 		}

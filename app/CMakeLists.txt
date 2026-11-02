@@ -9,8 +9,6 @@ target_sources(app PRIVATE
   src/usb_dev.c
 )
 
-target_sources(app PRIVATE
-  inc
-)
+target_include_directories(app PRIVATE inc)
 
 zephyr_library_include_directories(${ZEPHYR_BASE}/samples/bluetooth)
